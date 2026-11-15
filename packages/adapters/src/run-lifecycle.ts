@@ -1,8 +1,4 @@
-import {
-  runContinueJob,
-  SandboxUnavailableError,
-  SandboxUnresponsiveError,
-} from "@rakazo/adapter-kit";
+import { SandboxUnavailableError, SandboxUnresponsiveError } from "@rakazo/adapter-kit";
 import type { RunStatus } from "@rakazo/contracts";
 import {
   assertTransition,
@@ -29,6 +25,7 @@ import type { RunComputerUseState, RunLeaseState } from "./run-context.js";
 import { notifyRun } from "./run-notifications.js";
 import type { TakeoverResumeCheckpoint } from "./takeover-resume.js";
 import { continueRunClaimFence, TAKEOVER_RESUME_CHECKPOINTS } from "./takeover-resume.js";
+import { wakeRun } from "./wake-run.js";
 
 /**
  * Avoid an expensive remote workspace export when a turn never touched the computer. A failed
@@ -136,15 +133,12 @@ export async function failRunBeforeTurn(
   return true;
 }
 
-/** Queues the steered run that was waiting on this one, if any; a failed enqueue is logged, not thrown. */
+/** Starts the steered run that was waiting on this one, if any. */
 export async function enqueueSteeringContinuation(
   deps: Pick<ExecutorDeps, "jobs">,
   continuationRunId: string | null,
 ): Promise<void> {
-  if (!continuationRunId) return;
-  await deps.jobs
-    .enqueue(runContinueJob(continuationRunId))
-    .catch((error) => getLogger().error("steering continuation enqueue", error));
+  if (continuationRunId) await wakeRun(deps.jobs, continuationRunId);
 }
 
 export async function renewRunLease(
@@ -229,7 +223,7 @@ export async function startNextWaitingRun(
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     select: { id: true },
   });
-  if (next) await deps.jobs.enqueue(runContinueJob(next.id));
+  if (next) await wakeRun(deps.jobs, next.id);
 }
 
 /** Open the model only while this worker still owns the running lease. */
@@ -275,9 +269,12 @@ export async function writeComputerRunRequeue(
     leaseOwner: workerId,
     leaseFence: fence,
   };
+  // With no retry timer a queued run is due now. Set, so the legacy retry trigger does not
+  // stamp a delay that makes the release, which starts only due runs, pass over it.
+  const queuedWakeAt = retryAt ?? new Date();
   const releasedHold = {
     status: "queued" as const,
-    wakeAt: retryAt,
+    wakeAt: queuedWakeAt,
     error,
     leaseOwner: null,
     leaseExpiresAt: null,
@@ -290,12 +287,10 @@ export async function writeComputerRunRequeue(
     data: releasedHold,
   });
   if (preserve.count === 1) return true;
+  const requeue = computerRunRequeueData(resumeCheckpoint, error, heldForTakeover);
   const planned = await deps.prisma.run.updateMany({
     where: { ...whereLease, checkpoint: null },
-    data: {
-      ...computerRunRequeueData(resumeCheckpoint, error, heldForTakeover),
-      wakeAt: releasedHold.wakeAt,
-    },
+    data: { ...requeue, wakeAt: requeue.status === "queued" ? queuedWakeAt : retryAt },
   });
   if (planned.count === 1) return true;
   const retried = await deps.prisma.run.updateMany({
@@ -337,9 +332,7 @@ export async function requeueInterruptedRun(
     },
   });
   if (released.count !== 1) return false;
-  await deps.jobs
-    .enqueue({ ...runContinueJob(runId), availableAt: wakeAt })
-    .catch((error) => getLogger().error("run requeue", error));
+  await wakeRun(deps.jobs, runId, { at: wakeAt });
   return true;
 }
 
@@ -368,10 +361,7 @@ export async function requeueComputerRun(
     untilReleased ? null : retryAt,
   );
   if (!released || untilReleased) return;
-  await deps.jobs.enqueue({
-    ...runContinueJob(runId),
-    availableAt: retryAt,
-  });
+  await wakeRun(deps.jobs, runId, { at: retryAt });
 }
 
 /**
@@ -541,10 +531,7 @@ export async function retryRunSetup(
       }),
     );
     if (retryForever || dispatchHandedOff) {
-      await deps.jobs.enqueue({
-        ...runContinueJob(runId),
-        availableAt: retryAt,
-      });
+      await wakeRun(deps.jobs, runId, { at: retryAt });
       return;
     }
     throw new Error("Run setup failed; retrying", { cause: reportedSetupError });

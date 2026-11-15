@@ -53,6 +53,7 @@ import {
   InMemoryRealtimeFanout,
   installedMessaging,
   isMessagingSurfaceEnabled,
+  machineCleanupRecords,
   messagingPlatformsFromEnv,
   ObjectAgentHomeStore,
   PiAgentRuntime,
@@ -315,7 +316,9 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   await secrets.start();
   if (secrets.describe().capabilities.degraded)
     logger.warn("Secret storage degraded; encrypted credentials remain available");
-  prisma = withSecretPersistence(prisma, secrets);
+  // The queue is built from this client below; a secret dropped before then gets no retry.
+  let secretCleanupJobs: JobPublisher | undefined;
+  prisma = withSecretPersistence(prisma, secrets, () => secretCleanupJobs);
   installSecurityEventStore(prisma);
   installAuditEventStore(prisma);
   const unreadableMasterKeys = await verifyContentKeys(prisma);
@@ -373,6 +376,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       ),
       runs!,
     );
+  secretCleanupJobs = jobs;
   const ticketChanges = createTicketChangeNotifier({
     boardEvents,
     jobs,
@@ -397,6 +401,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       dataDir: env.dataDir,
       prisma,
       secrets,
+      unreferencedMachines: machineCleanupRecords(jobs),
     }));
   const memoryProviders = new SpaceMemoryProviderResolver(prisma, secrets);
   const oauthLogins = new PiOAuthLogins<ModelCredential>(undefined, { prisma, secrets });
@@ -476,7 +481,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   });
   const connectors = createConnectorRuntime(
     runtimeEnv,
-    { prisma, secrets, events },
+    { prisma, secrets, events, jobs },
     {
       network: remoteConnectors,
       composio: composioOverride,
@@ -853,7 +858,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
         return isTrustedOrigin(origin, env) ? origin : "";
       },
       credentials: true,
-      exposeHeaders: [SERVER_BUILD_HEADER],
+      exposeHeaders: [SERVER_BUILD_HEADER, "x-voice-id"],
     }),
   );
   // Session and account replies must never be stored by a client or an HTTP cache.

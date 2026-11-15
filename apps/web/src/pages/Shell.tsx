@@ -156,7 +156,7 @@ function SpaceShell() {
     setOverlay,
   } = useShellNavigation();
   const queries = spaceQueries(userId ?? null, shellSpaceId);
-  const roster = useSpaceRoster({ rpc, seed, botId, groupId, navigate, redirectKeepingOverlay });
+  const roster = useSpaceRoster({ rpc, seed, navigate, redirectKeepingOverlay });
   const {
     groups,
     setGroups,
@@ -597,6 +597,7 @@ function SpaceShell() {
     navigationRevision,
     overlayRevision,
     closeMobileSidebar: () => setMobileSidebarOpen(false),
+    beginSpaceSwitch: roster.beginSpaceSwitch,
   });
   useLayoutEffect(() => {
     openSpaceChatRef.current = openSpaceChat;

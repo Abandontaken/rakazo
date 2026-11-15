@@ -1,5 +1,5 @@
 import type { ProductAnalytics, RealtimeFanout } from "@rakazo/adapter-kit";
-import type { ChatAlert, MessageBlock, ProductEvent } from "@rakazo/contracts";
+import type { ChatAlert, MessageBlock, ProductEvent, SpaceChangeKind } from "@rakazo/contracts";
 import {
   AnalyticsTrigger,
   hasThinkingActivityMarker,
@@ -23,10 +23,6 @@ import { cancelRunsInTransaction } from "./cancel-runs.js";
 import { createChatAlerts } from "./chat-alerts.js";
 import type { PrismaClient } from "./client.js";
 import { Prisma } from "./client.js";
-import {
-  followComputerUpdateChanges,
-  publishComputerUpdateChange,
-} from "./computer-update-changes.js";
 import { expireComputerExecutionLeases } from "./computers.js";
 import { contentEncryptionOf } from "./content-encryption.js";
 import {
@@ -40,6 +36,7 @@ import {
   notifyCommittedEvent,
   notifyRealtime,
 } from "./event-stream.js";
+import { readMessageBlocks } from "./message-blocks.js";
 import type { RunLease } from "./messages.js";
 import {
   assertRunCanWriteHistory,
@@ -56,6 +53,7 @@ import { createRowId } from "./row-id.js";
 import { deleteRunSecretsInTransaction } from "./run-secrets.js";
 import { isRunResponse, readRunTimingFields } from "./run-timing.js";
 import { RUN_TURN_CHECKPOINT_KIND } from "./run-turn-checkpoint.js";
+import { followSpaceChanges, publishSpaceChange } from "./space-changes.js";
 import { SpaceDeletionInProgressError, spaceTakesWork } from "./spaces.js";
 import { draftRecordingsOfLease } from "./teaching-recordings.js";
 import type { AnswerRunInput, PauseRunForInput, RunSecretWriter } from "./thread-ask.js";
@@ -117,8 +115,8 @@ export interface ThreadEvents {
   ): AsyncGenerator<ChatAlert>;
   publishRosterChange?(change: RosterChange): Promise<void>;
   followRosterChanges?(userId: string, signal?: AbortSignal): AsyncGenerator<void>;
-  publishComputerUpdateChange?(spaceId: string): Promise<void>;
-  followComputerUpdateChanges?(spaceId: string, signal?: AbortSignal): AsyncGenerator<void>;
+  publishSpaceChange?(spaceId: string, kind: SpaceChangeKind): Promise<void>;
+  followSpaceChanges?(spaceId: string, signal?: AbortSignal): AsyncGenerator<SpaceChangeKind>;
   answerRunInput(input: AnswerRunInput): Promise<boolean>;
   append(input: AppendEventInput): Promise<ProductEvent>;
   claimSteering(input: ClaimSteeringInput): Promise<ClaimedSteeringMessage[]>;
@@ -252,10 +250,9 @@ export function createThreadEvents(
     ...(realtime && {
       followRosterChanges: (userId, signal) =>
         followRosterChanges(realtime, userId, () => loadRosterScope(prisma, userId), signal),
-      followComputerUpdateChanges: (spaceId, signal) =>
-        followComputerUpdateChanges(realtime, spaceId, signal),
+      followSpaceChanges: (spaceId, signal) => followSpaceChanges(realtime, spaceId, signal),
     }),
-    publishComputerUpdateChange: (spaceId) => publishComputerUpdateChange(realtime, spaceId),
+    publishSpaceChange: (spaceId, kind) => publishSpaceChange(realtime, spaceId, kind),
     answerRunInput: (input) => answerRunInput(prisma, input, realtime, options.runSecretWriter),
     append: (input) => appendEvent(prisma, input, realtime, options.analytics),
     claimSteering: (input) => claimSteering(prisma, input),
@@ -391,6 +388,8 @@ export async function clearThread(
     };
   }, THREAD_LOCK_TRANSACTION_OPTIONS);
   await notifyRealtime(realtime, committed.event.threadId, committed.event.seq);
+  if (committed.cancelledRunIds.length > 0)
+    await publishSpaceChange(realtime, input.spaceId, "runs");
   if (!input.groupId && committed.userId)
     await realtime?.publish(`incoming-calls:${committed.userId}`, "").catch(() => undefined);
   // Legacy execution bindings point at runs of pre-lease releases, which kept writing
@@ -500,7 +499,7 @@ export async function sendUserMessage(
                 trigger: true,
                 status: true,
                 userId: true,
-                sourceMessage: { select: { blocks: true } },
+                sourceMessage: { select: { id: true, blocks: true } },
               },
             })
           : [];
@@ -509,14 +508,16 @@ export async function sendUserMessage(
       const channelId = messagingChannelId(input.blocks);
       // A run acts with its sender's accounts, so another person's message waits for a run of
       // their own.
-      const steersRun = (run: (typeof activeRuns)[number]) =>
-        run.userId === input.userId &&
-        messageSteersRun(
-          input.trigger,
-          run.trigger,
-          channelId,
-          messagingChannelId(run.sourceMessage?.blocks as MessageBlock[] | undefined),
-        );
+      const steersRun = (run: (typeof activeRuns)[number]) => {
+        if (run.userId !== input.userId) return false;
+        const source = run.sourceMessage ? readMessageBlocks(run.sourceMessage) : undefined;
+        const runChannelId = messagingChannelId(source?.blocks);
+        // A source that lost entries may have lost its channel marker, so a chat-app message
+        // cannot be matched to that run's chat and gets a run of its own.
+        if (input.trigger === "messaging" && source?.intact === false && !runChannelId)
+          return false;
+        return messageSteersRun(input.trigger, run.trigger, channelId, runChannelId);
+      };
       const holdingRuns = activeRuns.filter(
         (run) => !messageBypassesTakeoverWait(run, fromGroup || steersRun(run)),
       );
@@ -624,6 +625,7 @@ export async function sendUserMessage(
     // The event is durable; subscribers recover it from their persisted cursor.
     getLogger().error("user message realtime notification", error);
   });
+  if (committed.run) await publishSpaceChange(realtime, input.spaceId, "runs");
   return {
     messageId: committed.message.id,
     seq: committed.message.seq,
@@ -746,6 +748,7 @@ export async function finalizeRun(
   const committed = await withTransactionRetry(() => finalizeRunOnce(prisma, input));
   if (!committed) return false;
   await notifyRealtime(realtime, committed.threadId, committed.seq);
+  await publishSpaceChange(realtime, input.spaceId, "runs");
   const timing = await readRunTimingFields(prisma, input.runId);
   if (committed.firstResponse) {
     getLogger().info("run.first_response", { "run.id": input.runId, ...timing });

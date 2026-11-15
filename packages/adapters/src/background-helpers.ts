@@ -1,4 +1,3 @@
-import { runContinueJob } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import {
   ACTIVE_RUN_STATUSES,
@@ -7,11 +6,12 @@ import {
   isConversationalRun,
   STOPPED_HELPER_RESULT,
 } from "@rakazo/core";
-import type { Prisma } from "@rakazo/db";
 import {
   appendEventInTransaction,
   assertRunCanWriteHistory,
+  changeMessageBlocks,
   createThreadMessageInTransaction,
+  storedMessageBlocks,
   THREAD_LOCK_TRANSACTION_OPTIONS,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
@@ -26,6 +26,7 @@ import type { ExecutorDeps } from "./executor-deps.js";
 import { helperResultText, MAX_PARALLEL_SUBAGENTS } from "./pi-runtime-subagent.js";
 import type { RunContext } from "./run-context.js";
 import { runLeaseFor } from "./run-messages.js";
+import { wakeRun } from "./wake-run.js";
 
 const RESULT_LIMIT = 12_000;
 
@@ -167,10 +168,7 @@ export async function startBackgroundHelper(
   await deps.events.notify(thread.id, committed.eventSeq).catch((error) => {
     getLogger().error("background helper card notification", error);
   });
-  await deps.jobs.enqueue(runContinueJob(committed.helperRunId)).catch((error) => {
-    // The queued run is durable; the job reconciler repairs a missed wake.
-    getLogger().error("background helper enqueue", error);
-  });
+  await wakeRun(deps.jobs, committed.helperRunId);
   return started;
 }
 
@@ -213,7 +211,7 @@ export async function returnHelperOutcome(
       where: { id: run.sourceMessageId, threadId: source.threadId },
       select: { id: true, threadId: true, blocks: true },
     });
-    const blocks = Array.isArray(card?.blocks) ? (card.blocks as MessageBlock[]) : [];
+    const blocks = card ? storedMessageBlocks(card) : [];
     const helper = blocks.find((block): block is HelperBlock => block.kind === "subagent");
     // The chat was cleared since: nothing is left to settle or answer.
     if (!card || !helper) return null;
@@ -227,11 +225,10 @@ export async function returnHelperOutcome(
       progress: undefined,
       result,
     };
-    const nextBlocks = blocks.map((block) => (block === helper ? settled : block));
-    await tx.message.update({
-      where: { id: card.id },
-      data: { blocks: nextBlocks as Prisma.InputJsonValue },
-    });
+    const next = changeMessageBlocks(card, (block) => (block === helper ? settled : block));
+    if (!next) return null;
+    const nextBlocks = next.blocks;
+    await tx.message.update({ where: { id: card.id }, data: { blocks: next.stored } });
     const event = await appendEventInTransaction(tx, {
       spaceId: run.spaceId,
       threadId: card.threadId,
@@ -282,10 +279,5 @@ export async function returnHelperOutcome(
   await deps.events.notify(committed.threadId, committed.eventSeq).catch((error) => {
     getLogger().error("background helper card notification", error);
   });
-  if (committed.wakeRunId) {
-    // A missed enqueue is repaired by the job reconciler, like any queued run.
-    await deps.jobs?.enqueue(runContinueJob(committed.wakeRunId)).catch((error) => {
-      getLogger().error("background helper result enqueue", error);
-    });
-  }
+  if (committed.wakeRunId && deps.jobs) await wakeRun(deps.jobs, committed.wakeRunId);
 }

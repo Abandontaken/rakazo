@@ -63,7 +63,8 @@ jobs:
       - run: pnpm db:generate
         env:
           DATABASE_URL: postgres://rakazo:rakazo@127.0.0.1:5433/rakazo
-      - run: pnpm build
+      # The size budgets read the bundles this step just built, in a fraction of a second.
+      - run: pnpm build && node scripts/checks/bundle-size.mjs
         env:
           DATABASE_URL: postgres://rakazo:rakazo@127.0.0.1:5433/rakazo
           BETTER_AUTH_SECRET: ci-build-auth-secret-at-least-32-characters
@@ -209,7 +210,6 @@ jobs:
             packages/adapters/src/lark-lazy-loading.test.ts \
             packages/page-kit/src/kit/labels.test.tsx \
             packages/testkit/src/eas-pnpm-version.test.ts \
-            packages/testkit/src/feature-map.test.ts \
             packages/testkit/src/ios-screenshot-catalog.test.ts)
           # Vitest rejects more shards than test files, so a small set runs whole on the first shard.
           files="$(pnpm exec vitest list --filesOnly "${targets[@]}" | grep -c '\.test\.' || true)"
