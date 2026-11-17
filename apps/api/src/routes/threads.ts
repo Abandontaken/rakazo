@@ -27,6 +27,7 @@ import {
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { answerComputerRequest } from "../computer-control.js";
+import { HANG_UP_PROMPT } from "../hidden-turns.prompt.js";
 import type { RouterDeps } from "../router.js";
 import { createRoutineTestRun, routineTestRunNonce, routineTestTarget } from "../routines.js";
 import { assertTeachingSendAllowed } from "../taught-skills.js";
@@ -55,7 +56,6 @@ import {
   sendThreadMessage,
   threadHead,
 } from "../thread-target.js";
-import { mapBotSecretInputError } from "./bots.js";
 import type { RouterContext } from "./context.js";
 import {
   botsRunOwnModels,
@@ -71,10 +71,6 @@ import {
 export function callMarkerClientNonce(callId: string): string {
   return `${CALL_CLIENT_NONCE_PREFIX}${callId}:marker`;
 }
-
-/** The card is closed by a marker; the run that follows finishes whatever the call left open. */
-const HANG_UP_PROMPT =
-  "The voice call just ended because the user hung up. First call end_call with a short title for the call (leave farewell empty). Then, if anything the user asked for during the call is still unfinished, complete it now as a normal chat reply with full formatting. If nothing is pending, reply with one short sentence.";
 
 /** A send with routines that already has runs saved under its nonce. */
 class SavedSubmission extends Error {}
@@ -611,8 +607,7 @@ export function threadsRoutes(ctx: RouterContext) {
           .catch((error: unknown) => {
             if (error instanceof AnswerTooLongError)
               throw new ClientError("BAD_REQUEST", error.message);
-            // A typed credential its destination cannot carry (e.g. a header with a line break).
-            throw mapBotSecretInputError(error);
+            throw error;
           });
         if (!answered) {
           throw new ORPCError("CONFLICT", {

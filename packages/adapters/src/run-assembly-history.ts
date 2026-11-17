@@ -133,6 +133,7 @@ export async function loadTurnContext(
       id: message.id,
       role: message.role,
       runId: message.runId,
+      createdAt: message.createdAt,
       blocks: storedMessageBlocks(message),
     }));
   const currentTurnMessage = userTurnMessageForRun(
@@ -150,6 +151,7 @@ export async function loadTurnContext(
       threadId: thread.id,
       OR: [
         ...(run.sourceMessageId ? [{ id: run.sourceMessageId }] : []),
+        ...(run.trigger === "helper" ? [{ runId }] : []),
         { steeringMessages: { some: { runId, botId: run.botId } } },
       ],
       role: "user",
@@ -168,7 +170,9 @@ export async function loadTurnContext(
   // The send decided whether the message named this member; one it named nobody for
   // reached every member, and each may end its turn without a reply.
   const groupReplyOptional =
-    Boolean(thread.groupId) && run.trigger === "user" && run.groupReplyOptional;
+    Boolean(parts.records.conversationThread.groupId) &&
+    run.trigger === "user" &&
+    run.groupReplyOptional;
   const allowSilentPeerMessage = botMessageAllowsSilence(
     peerMessage?.intent,
     peerMessage?.repliesToRequest,

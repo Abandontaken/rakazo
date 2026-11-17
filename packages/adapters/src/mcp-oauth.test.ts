@@ -1,4 +1,7 @@
 import { MCP_OAUTH_CLIENT_REQUIRED } from "@rakazo/contracts";
+import { ClientError } from "@rakazo/core";
+import type { Deferred } from "@rakazo/core/test-async";
+import { deferred } from "@rakazo/core/test-async";
 import { getLogger } from "@rakazo/logging";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OAuthMaterial } from "./mcp-oauth.js";
@@ -6,6 +9,9 @@ import {
   launchArgSecrets,
   McpOAuthBroker,
   McpOAuthClientRequiredError,
+  McpOAuthRefusedError,
+  McpOAuthStoreError,
+  McpOAuthUnavailableError,
   McpReauthorizationRequiredError,
   oauthMaterialSecrets,
   StoredMcpOAuthProvider,
@@ -95,6 +101,7 @@ function chunkedBody(totalBytes: number, chunkBytes: number): ReadableStream<Uin
 async function rejectedOAuthBegin(
   register: (() => Response | Promise<Response>) | null,
   secret?: string,
+  put: () => Promise<unknown> = async () => ({ id: "secret-1", ciphertext: "encrypted" }),
 ): Promise<Error> {
   vi.stubGlobal(
     "fetch",
@@ -174,7 +181,7 @@ async function rejectedOAuthBegin(
     prisma as never,
     {
       load: vi.fn(() => JSON.stringify(secret ? { secret } : {})),
-      put: vi.fn(async () => ({ id: "secret-1", ciphertext: "encrypted" })),
+      put: vi.fn(put),
     } as never,
     TEST_NETWORK,
   );
@@ -334,7 +341,7 @@ describe("MCP OAuth", () => {
       ...tables,
       $transaction: async <T>(callback: (tx: unknown) => Promise<T>, options?: unknown) => {
         transactionOptions.push(options);
-        let release: (() => void) | undefined;
+        let release: Deferred | undefined;
         const created: string[] = [];
         const tx = {
           ...tables,
@@ -350,9 +357,8 @@ describe("MCP OAuth", () => {
             lockSettings.push(sql.join("?"));
             if (!sql.join("").includes("pg_advisory_xact_lock") || release) return 1;
             const held = lock;
-            lock = new Promise<void>((resolve) => {
-              release = resolve;
-            });
+            release = deferred();
+            lock = release.promise;
             await held;
             credentialLocked = true;
             return 1;
@@ -366,7 +372,7 @@ describe("MCP OAuth", () => {
           throw error;
         } finally {
           if (release) credentialLocked = false;
-          release?.();
+          release?.resolve();
         }
       },
     };
@@ -611,14 +617,11 @@ describe("MCP OAuth", () => {
     const shared = sharedCredentials(reauthorizableMaterial());
     // Hold both 401s until each process has one.
     let rejected = 0;
-    let releaseRejections: () => void = () => undefined;
-    const bothRejected = new Promise<void>((resolve) => {
-      releaseRejections = resolve;
-    });
+    const bothRejected = deferred();
     const mcp = earlyRevokingMcpServer(auth.fetch, async () => {
       rejected += 1;
-      if (rejected === 2) releaseRejections();
-      await bothRejected;
+      if (rejected === 2) bothRejected.resolve();
+      await bothRejected.promise;
     });
     const api = await shared.startProcess(mcp.network);
     const worker = await shared.startProcess(mcp.network);
@@ -894,7 +897,11 @@ describe("MCP OAuth", () => {
         spaceId: shared.context.spaceId,
         userId: shared.context.userId,
       }),
-    ).rejects.toThrow("MCP OAuth session is invalid or expired");
+    ).rejects.toMatchObject({
+      name: "McpOAuthRefusedError",
+      kind: "BAD_REQUEST",
+      message: "MCP OAuth session is invalid or expired",
+    });
   });
 
   it("keeps a reconnection's client when the earlier flow's tokens land late", async () => {
@@ -1457,6 +1464,45 @@ describe("MCP OAuth", () => {
     expect(await broker.statusFor(shared.server, shared.context)).toBe("reconnect");
   });
 
+  it("keeps a token stored after the rejected one when neither has a refresh token", async () => {
+    const material = expiringMaterial(Date.now());
+    delete (material.oauth.tokens as { refresh_token?: string }).refresh_token;
+    const shared = sharedCredentials(material);
+    const poll = await shared.startProcess(vi.fn());
+    // The user reconnects while a request with the old token is still out.
+    const api = await shared.startProcess(vi.fn());
+    await api.provider.saveTokens({ access_token: "new-access", token_type: "Bearer" });
+
+    await expect(poll.provider.replaceRejectedToken()).resolves.toBeUndefined();
+
+    expect((await shared.stored()).oauth?.tokens).toMatchObject({ access_token: "new-access" });
+    expect(await poll.broker.statusFor(shared.server, shared.context)).toBe("connected");
+  });
+
+  it("keeps a newer access token when the refresh token did not change", async () => {
+    const material = expiringMaterial(Date.now() - 60_000);
+    material.oauth.tokens.refresh_token = "stable-refresh";
+    const shared = sharedCredentials(material);
+    const stale = await shared.startProcess(vi.fn());
+    const fresh = await shared.startProcess(vi.fn());
+    await fresh.provider.saveTokens({
+      access_token: "new-access",
+      refresh_token: "stable-refresh",
+      token_type: "Bearer",
+    });
+    const saved = (await shared.stored()).oauth;
+
+    await stale.provider.saveDiscoveryState({
+      authorizationServerUrl: "https://auth.example.test",
+    });
+
+    expect((await shared.stored()).oauth).toMatchObject({
+      tokens: { access_token: "new-access", refresh_token: "stable-refresh" },
+      obtainedAt: saved?.obtainedAt,
+    });
+    expect(saved?.obtainedAt).toBeGreaterThan(material.oauth.obtainedAt);
+  });
+
   it("rejects unsafe browser authorization URLs", async () => {
     const onAuthorization = vi.fn();
     const provider = new StoredMcpOAuthProvider(
@@ -1564,7 +1610,15 @@ describe("MCP OAuth", () => {
     expect(onAuthorization).toHaveBeenCalledWith(authorizationUrl);
   });
 
-  it("clears stale tokens when runtime authorization URL validation fails", async () => {
+  it.each([
+    ["an unsafe", new URL("http://auth.example.test/authorize")],
+    [
+      "an over-long",
+      new URL(
+        `https://auth.example.test/authorize?scope=${"x".repeat(MAX_AUTHORIZATION_URL_LENGTH)}`,
+      ),
+    ],
+  ])("asks for a reconnect at runtime even with %s authorization URL", async (_, url) => {
     const persisted: { oauth?: { tokens?: unknown } }[] = [];
     const provider = new StoredMcpOAuthProvider(
       "server-1",
@@ -1574,9 +1628,9 @@ describe("MCP OAuth", () => {
       },
     );
 
-    await expect(
-      provider.redirectToAuthorization(new URL("http://auth.example.test/authorize")),
-    ).rejects.toThrow(/HTTPS/i);
+    await expect(provider.redirectToAuthorization(url)).rejects.toBeInstanceOf(
+      McpReauthorizationRequiredError,
+    );
 
     expect(await provider.tokens()).toBeUndefined();
     expect(persisted.at(-1)?.oauth?.tokens).toBeUndefined();
@@ -2133,9 +2187,60 @@ describe("MCP OAuth", () => {
         () => null,
         (caught: unknown) => caught,
       );
-    expect(error).toBeInstanceOf(Error);
+    // The server's own refusal of the sign-in is the person's to fix, not a fault.
+    expect(error).toBeInstanceOf(McpOAuthRefusedError);
     expect((error as Error).message).toBe("Could not start MCP OAuth");
     expect((error as Error).message).not.toContain("UPSTREAM_BODY_MARKER");
+  });
+
+  it("answers an unreachable sign-in server as unavailable, not as the person's mistake", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed", {
+          cause: Object.assign(new Error("connect refused"), {
+            code: "ECONNREFUSED",
+            syscall: "connect",
+          }),
+        });
+      }),
+    );
+    const prisma = {
+      mcpServer: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "server-1",
+          endpoint: "https://mcp.example.test/mcp",
+          secretId: null,
+        }),
+      },
+      secret: { findFirst: vi.fn() },
+      mcpOAuthSession: oauthSessionStore(),
+    };
+    const broker = new McpOAuthBroker(prisma as never, { put: vi.fn() } as never, TEST_NETWORK);
+
+    await expect(
+      broker.begin({
+        serverId: "server-1",
+        spaceId: "workspace-1",
+        userId: "user-1",
+        redirectUri: "http://127.0.0.1:5173/mcp/oauth/callback",
+      }),
+    ).rejects.toBeInstanceOf(McpOAuthUnavailableError);
+  });
+
+  it("lets a failure of our own during sign-in propagate as a fault", async () => {
+    const error = await rejectedOAuthBegin(
+      () =>
+        Response.json(
+          { client_id: "fake-client", redirect_uris: ["http://127.0.0.1:5173/mcp/oauth/callback"] },
+          { status: 201 },
+        ),
+      undefined,
+      async () => {
+        throw new Error("secret store write failed");
+      },
+    );
+    expect(error).not.toBeInstanceOf(ClientError);
   });
 
   it("reports the HTTP status and OAuth error when registration is rejected", async () => {
@@ -3290,6 +3395,86 @@ describe("MCP OAuth", () => {
       expect(url.searchParams.get("access_type")).toBe("offline");
       expect(url.searchParams.get("prompt")).toBe("consent");
       expect(url.searchParams.get("client_id")).toBe("registered-client");
+    });
+
+    it.each([
+      ["the issued link is refused", { scope: "x".repeat(MAX_AUTHORIZATION_URL_LENGTH) }],
+      [
+        "the configured parameters push the link past the limit",
+        { authorization_params: `login_hint=${"y".repeat(MAX_AUTHORIZATION_URL_LENGTH)}` },
+      ],
+    ])("answers a sign-in link we refuse as a refusal when %s", async (_name, client) => {
+      nonRegisteringAuthServer(() => undefined, { challenge: false });
+      const { broker } = brokerWithMaterial({ oauthClient: { ...oauthClient, ...client } });
+
+      const error = await broker
+        .begin({
+          serverId: "server-1",
+          spaceId: "workspace-1",
+          userId: "user-1",
+          redirectUri: "https://app.example.test/mcp/oauth/callback",
+        })
+        .then(
+          () => null,
+          (caught: unknown) => caught,
+        );
+
+      expect(error).toBeInstanceOf(McpOAuthRefusedError);
+      expect((error as Error).message).toBe("Could not start MCP OAuth");
+      expect((error as Error).cause).toBeInstanceOf(McpOAuthRefusedError);
+    });
+
+    function beginError(broker: McpOAuthBroker) {
+      return broker
+        .begin({
+          serverId: "server-1",
+          spaceId: "workspace-1",
+          userId: "user-1",
+          redirectUri: "https://app.example.test/mcp/oauth/callback",
+        })
+        .then(
+          () => null,
+          (caught: unknown) => caught,
+        );
+    }
+
+    /** A server that challenges but publishes no metadata, so every discovery probe answers 404. */
+    function metadataLessServer() {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (
+            logicalHref(input, init) === "https://mcp.example.test/mcp" &&
+            request.method === "POST"
+          )
+            return new Response(null, { status: 401 });
+          return new Response("not found", { status: 404 });
+        }),
+      );
+    }
+
+    it("answers our own failure to save sign-in state as a fault after discovery's 404s", async () => {
+      metadataLessServer();
+      const { broker, secrets } = brokerWithMaterial({ oauthClient });
+      const storeDown = new Error("secret store unavailable");
+      secrets.put.mockRejectedValue(storeDown);
+
+      const error = await beginError(broker);
+
+      expect(error).toBeInstanceOf(McpOAuthStoreError);
+      expect(error).not.toBeInstanceOf(ClientError);
+      expect((error as Error).cause).toBe(storeDown);
+    });
+
+    it("still answers the server's refusal of the sign-in as a refusal", async () => {
+      metadataLessServer();
+      const { broker } = brokerWithMaterial({});
+
+      const error = await beginError(broker);
+
+      expect(error).toBeInstanceOf(McpOAuthRefusedError);
+      expect((error as Error).message).toBe("Could not start MCP OAuth");
     });
 
     it("treats the client secret as a credential that must never be shown", () => {

@@ -135,6 +135,13 @@ export function persistentComputerInstruction(options: {
   return `You have a persistent sandbox${capabilities}. This backend does not provide model-visible graphical control.${toolSentence}`;
 }
 
+/** Only where the desktop-protection guard checks shell commands. */
+export function desktopGuardShellInstruction(offeredToolNames: ReadonlySet<string>) {
+  if (!offeredToolNames.has("shell")) return undefined;
+  const write = offeredToolNames.has("write_file") ? "a script with write_file" : "a script file";
+  return `Shell commands must be literal: no \`$(...)\`, backticks, subshells, loop or computed variables, or interpreter heredocs. For more, write ${write} and run it with \`python3\` or \`bash\`.`;
+}
+
 export function dockerComputerToolInstruction(
   computerKind: string,
   disabled?: ReadonlySet<string>,
@@ -159,7 +166,7 @@ export function dockerComputerToolInstruction(
   }
   if (shellOffered) {
     parts.push(
-      "Python 3 is installed as `python3`. For ordinary file processing, use `python3 -c` with a quoted script; interpreter heredocs are blocked by the desktop guard. If `python` is not found, retry with `python3`. A command-syntax refusal is not a filesystem permission error; continue ordinary file work with supported tools.",
+      "Python 3 is installed as `python3`; if `python` is not found, retry with `python3`.",
     );
   }
   if (navigate && act) {
@@ -382,6 +389,10 @@ export function formatSharedSpaceNote(memberNames: string[], requesterName?: str
     .join(" ");
 }
 
+/** Bots otherwise learn only their own name, and ask the user what Rakazo is. */
+export const RAKAZO_PLATFORM_INSTRUCTION =
+  "You run on Rakazo, the open-source platform where the user creates and chats with bots like you. You know Rakazo, so never ask the user to explain it; read the Rakazo skill when you need details.";
+
 // Ordering matters: stable blocks first, volatile ones last, so the prefix stays cacheable.
 export function userTurnInstructions(parts: {
   botInstructions: string;
@@ -412,6 +423,7 @@ export function userTurnInstructions(parts: {
   userComputer?: UserComputerState;
 }): (string | undefined)[] {
   return [
+    RAKAZO_PLATFORM_INSTRUCTION,
     parts.botInstructions,
     parts.historyRetrievalEnabled &&
     builtinOffered(parts.disabledBuiltinTools, "search_history") &&
@@ -438,8 +450,8 @@ export function userTurnInstructions(parts: {
       parts.disabledBuiltinTools,
       "run_subagent",
       parts.backgroundHelpersAllowed
-        ? "run_subagent is a short helper. It is not a bot, has no thread, and does not show in the list. Use it for parallel work you will summarize here. For longer work the user need not wait on, or when they ask for it, set background true and end your turn: you stay free for their next message, and the result comes back to you later to pass on. A background helper cannot use the computer, ask the user, or change memory, skills or routines; do those yourself when its result comes back."
-        : "run_subagent is a short helper. It is not a bot, has no thread, and does not show in the list. Use it for parallel work you will summarize here.",
+        ? "run_subagent delegates work independently and returns immediately. Use it for work another agent can complete. Its result comes back later; end your turn when nothing else needs doing, and remain available for new user messages. Wait for the needed results before giving a final answer, combine related results, and honor newer instructions or cancellation. Subagents can act under the applicable permissions and request approval in this chat."
+        : "Subagent delegation is unavailable in this conversation. Complete the work yourself; do not claim to have delegated it.",
     ),
     parts.botDirectory,
     offeredBuiltinClause(
@@ -454,7 +466,7 @@ export function userTurnInstructions(parts: {
       offeredBuiltinClause(
         parts.disabledBuiltinTools,
         "skill_read",
-        "When asked how Rakazo or you work, or how to set something up (apps, the user's own computer, billing), read the Rakazo skill before answering or acting.",
+        "For anything about Rakazo itself (what it is, how it or you work, setup, its source code), read the Rakazo skill first.",
       ),
     parts.taughtSkillsLine,
     offeredBuiltinClause(

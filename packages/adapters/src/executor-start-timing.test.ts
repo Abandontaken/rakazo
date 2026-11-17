@@ -36,6 +36,7 @@ const sink = createTestSink();
 
 function fixture(
   options: {
+    stoppingSignal?: AbortSignal;
     startedAt?: Date;
     switching?: boolean;
     dedicated?: boolean;
@@ -84,6 +85,7 @@ function fixture(
   const executor = createRunExecutor({
     prisma,
     jobs: { enqueue },
+    stoppingSignal: options.stoppingSignal,
   } as unknown as Parameters<typeof createRunExecutor>[0]);
   return {
     prisma,
@@ -103,43 +105,26 @@ describe("execution start timing", () => {
 
   afterEach(() => installLogger(createLogger({ service: "test", level: "off", sinks: [] })));
 
-  it.each(["busy", "switching"])(
-    "does not report execution while the computer is %s",
-    async (state) => {
-      if (state === "busy") leases.acquire.mockRejectedValue(new ComputerBusyError());
-      const { prisma, enqueue, start } = fixture({
-        switching: state === "switching",
-      });
-      await start();
-      expect(
-        prisma.run.updateMany.mock.calls.every(([args]) => args.data.startedAt === undefined),
-      ).toBe(true);
-      expect(sink.events.some((event) => event.message === "run.execution_started")).toBe(false);
-      expect(prisma.attempt.create).not.toHaveBeenCalled();
-      expect(enqueue).toHaveBeenCalledOnce();
-    },
-  );
+  it.each(["busy"])("starts model work while the computer is %s", async (state) => {
+    leases.acquire.mockRejectedValue(new ComputerBusyError());
+    const { prisma, enqueue, start } = fixture({ switching: state === "switching" });
+    await expect(start()).rejects.toThrow("attempt setup failed");
+    expect(leases.acquire).not.toHaveBeenCalled();
+    expect(leases.dedicated).not.toHaveBeenCalled();
+    expect(prisma.attempt.create).toHaveBeenCalledTimes(2);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(sink.events.some((event) => event.message === "run.execution_started")).toBe(true);
+  });
 
-  it("waits due, without a retry timer, while another run of the bot holds the computer", async () => {
-    const now = new Date("2026-11-01T12:00:00Z");
-    vi.useFakeTimers({ toFake: ["Date"], now });
-    try {
-      leases.acquire.mockRejectedValue(new ComputerBusyError());
-      const { prisma, enqueue, start } = fixture({ heldBy: "lease-of-run-0" });
-      await start();
-      expect(enqueue).not.toHaveBeenCalled();
-      expect(prisma.run.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ status: "queued", wakeAt: now }),
-        }),
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+  it("requeues during a computer switch before capturing a stale computer", async () => {
+    const { enqueue, start } = fixture({ switching: true });
+    await expect(start()).resolves.toBeUndefined();
+    expect(enqueue).toHaveBeenCalled();
+    expect(leases.acquire).not.toHaveBeenCalled();
   });
 
   it.each([undefined, new Date("2026-01-01T00:00:00Z")])(
-    "stamps execution after acquiring the computer and preserves the first start (%s)",
+    "stamps execution without claiming a computer and preserves the first start (%s)",
     async (startedAt) => {
       const { prisma, start } = fixture({ startedAt });
       leases.acquire.mockImplementation(async () => {
@@ -157,24 +142,25 @@ describe("execution start timing", () => {
           leaseOwner: "worker-1",
           leaseFence: 1,
         },
-        data: { startedAt: startedAt ?? expect.any(Date) },
+        data: { startedAt: startedAt ?? expect.any(Date), lateSince: undefined },
       });
       expect(sink.events.filter((event) => event.message === "run.execution_started")).toHaveLength(
         1,
       );
-      expect(leases.release).toHaveBeenCalledWith(prisma, lease);
+      expect(leases.acquire).not.toHaveBeenCalled();
+      expect(leases.release).toHaveBeenCalledWith(prisma, null);
     },
   );
 
   it.each(["lost fence", "database error"])(
     "releases a dedicated computer if the start update encounters %s",
     async (failure) => {
-      const { prisma, start } = fixture({ dedicated: true });
+      const { prisma, start } = fixture({ dedicated: true, checkpoint: "takeover" });
       leases.acquire.mockResolvedValue(null);
       leases.dedicated.mockImplementation(async () => {
         // Dedicated acquisition requires running status but must precede the timestamp.
         expect(prisma.run.updateMany).toHaveBeenLastCalledWith(
-          expect.objectContaining({ data: { status: "running" } }),
+          expect.objectContaining({ data: { status: "running", computerUseStartedAt: null } }),
         );
         return lease;
       });
@@ -207,6 +193,19 @@ it("reuses the attempt a failed write already committed, adding no second row", 
     where: { runId: "run-1", fence: expect.any(Number) },
   });
   expect(prisma.attempt.create).toHaveBeenCalledOnce();
+});
+
+it("claims nothing when the process begins stopping while the run is being looked up", async () => {
+  const stopping = new AbortController();
+  const { prisma, start } = fixture({ stoppingSignal: stopping.signal });
+  const run = await prisma.run.findUnique();
+  prisma.run.findUnique.mockImplementation(async () => {
+    stopping.abort();
+    return run;
+  });
+  await start();
+  expect(prisma.run.updateMany).not.toHaveBeenCalled();
+  expect(leases.acquire).not.toHaveBeenCalled();
 });
 
 it("stops a superseded claim before it settles the new attempt's takeover cards", async () => {

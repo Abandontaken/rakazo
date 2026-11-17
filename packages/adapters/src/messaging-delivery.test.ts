@@ -20,6 +20,7 @@ import {
   CHAT_APP_TAKEOVER_NOTE,
   TAKEOVER_COMPUTER_PENDING_STATE,
 } from "@rakazo/core";
+import { deferred } from "@rakazo/core/test-async";
 import type { Prisma, PrismaClient } from "@rakazo/db";
 import { SpaceDeletionInProgressError } from "@rakazo/db";
 import type { Adapter } from "chat";
@@ -351,6 +352,9 @@ function createPrisma(world: World, jobs: ReturnType<typeof createJobs>) {
       }),
     },
     event: {
+      findMany: vi.fn(async ({ where }: { where: Where }) =>
+        world.events.filter((event) => matches(event, where)).map(copy),
+      ),
       create: vi.fn(async ({ data }: { data: Where }) => {
         const event = { id: `evt-${world.events.length + 1}`, createdAt: new Date(), ...data };
         world.events.push(event);
@@ -709,14 +713,6 @@ const backupJob = (t: Setup, outboundId: string) =>
   t.jobs.scheduled.get(messagingSendJobKey(outboundId));
 const sendJobs = (t: Setup) =>
   [...t.jobs.scheduled.values()].filter((job) => job.name === "messaging.send");
-
-function gate() {
-  let open!: () => void;
-  const opened = new Promise<void>((resolve) => {
-    open = resolve;
-  });
-  return { opened, open };
-}
 
 describe("deliverRun to a 1:1 chat", () => {
   it("sends a chat run's reply to its owner's conversation and settles its jobs", async () => {
@@ -1203,6 +1199,128 @@ describe("deliverRun to a 1:1 chat", () => {
 
     expect(t.sendToThread).not.toHaveBeenCalled();
     expect(t.world.outbound.map((row) => row.status)).toEqual(["failed", "failed"]);
+  });
+});
+
+describe("independent subagent delivery", () => {
+  function delegated(source: unknown[] = [{ kind: "text", text: "Research" }]) {
+    const t = setup();
+    addRun(t.world, {
+      trigger: "helper_result",
+      replies: [text("result-message", "The findings")],
+    });
+    const origin = {
+      id: "parent",
+      botId: "bot-1",
+      spaceId: "ws-1",
+      userId: "user-1",
+      trigger: "messaging",
+      threadId: "thread-1",
+      status: "completed",
+      thread: {},
+      sourceMessage: { blocks: source },
+    };
+    Object.assign(t.prisma.run, { findFirst: vi.fn(async () => origin) });
+    Object.assign(t.world.runs[0]!, { delegatedFromRunId: "parent", spaceId: "ws-1" });
+    return t;
+  }
+
+  it("returns a helper result to the originating direct chat", async () => {
+    const t = delegated();
+    await t.delivery.deliverRun("run-1");
+    expect(t.sendToThread).toHaveBeenCalledWith(
+      expect.objectContaining({ body: "The findings" }),
+      expect.anything(),
+    );
+  });
+
+  it("keeps private answers in delegated work out of an external group", async () => {
+    const t = delegated([
+      {
+        kind: "channel_message",
+        channelId: "ch-1",
+        provider: "sendblue",
+        fromAddress: "sender",
+        fromLabel: "Sender",
+        text: "Research",
+        hop: 0,
+      },
+    ]);
+    t.world.messages.push({
+      id: "private-answer",
+      runId: "parent",
+      threadId: "thread-1",
+      role: "bot",
+      seq: 4,
+      clientNonce: null,
+      replyToMessageId: null,
+      blocks: [{ kind: "ask", text: "Private", status: "answered", answer: "Private answer" }],
+    });
+    await t.delivery.deliverRun("run-1");
+    expect(t.sendToThread).not.toHaveBeenCalled();
+    expect(t.world.outbound).toEqual([]);
+  });
+
+  it.each([false, true])(
+    "keeps a result influenced by private app steering out of external delivery (team: %s)",
+    async (team) => {
+      const t = delegated();
+      if (team) {
+        Object.assign(t.prisma.run, {
+          findFirst: vi.fn(async () => ({
+            id: "parent",
+            trigger: "messaging",
+            thread: { externalConversationId: "team-conversation" },
+          })),
+        });
+      }
+      t.world.events.push({
+        id: "steering-claim",
+        runId: "run-1",
+        type: "run.steering.claimed",
+        payload: { steeringIds: ["already-deleted-private-steering"], nextMessageSeq: 2 },
+      });
+      await t.delivery.deliverRun("run-1");
+      expect(t.sendToThread).not.toHaveBeenCalled();
+      expect(t.world.outbound).toEqual([]);
+    },
+  );
+
+  it("delivers a result when every consumed steering claim has external provenance", async () => {
+    const t = delegated();
+    t.world.events.push({
+      id: "safe-claim",
+      runId: "run-1",
+      type: "run.steering.claimed",
+      payload: { externalSafe: true },
+    });
+    await t.delivery.deliverRun("run-1");
+    expect(t.sendToThread).toHaveBeenCalledWith(
+      expect.objectContaining({ body: "The findings" }),
+      expect.anything(),
+    );
+  });
+
+  it.each([false, "true", null])(
+    "refuses an unsafe or malformed steering delivery proof: %j",
+    async (externalSafe) => {
+      const t = delegated();
+      t.world.events.push({
+        id: "unsafe-claim",
+        runId: "run-1",
+        type: "run.steering.claimed",
+        payload: { externalSafe },
+      });
+      await t.delivery.deliverRun("run-1");
+      expect(t.sendToThread).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not guess a destination when delegation provenance is missing", async () => {
+    const t = delegated();
+    Object.assign(t.prisma.run, { findFirst: vi.fn(async () => null) });
+    await t.delivery.deliverRun("run-1");
+    expect(t.sendToThread).not.toHaveBeenCalled();
   });
 });
 
@@ -2035,20 +2153,15 @@ describe("a claimed send and its backup job", () => {
     vi.useFakeTimers();
     const t = setup();
     const [id] = await t.record(threadLane("t-a"), [post("t-a", "raced")]);
-    let land!: () => void;
-    t.sendToThread.mockImplementationOnce(
-      () =>
-        new Promise<MessagingSendResult>((resolve) => {
-          land = () => resolve({ handle: "first" });
-        }),
-    );
+    const land = deferred<MessagingSendResult>();
+    t.sendToThread.mockImplementationOnce(() => land.promise);
     const sending = t.delivery.send([threadLane("t-a")]);
     await vi.advanceTimersByTimeAsync(MESSAGING_SEND_STALE_MS);
     await sending;
     // The claim went stale; the backup job takes it over and sends.
     t.world.outbound[0]!.updatedAt = new Date(Date.now() - MESSAGING_SEND_STALE_MS - 1);
     await t.delivery.sendJob(id!, attempt(1));
-    land();
+    land.resolve({ handle: "first" });
     await vi.advanceTimersByTimeAsync(1_000);
 
     // The backup job's handle stands; the late "first" result changes nothing.
@@ -2413,16 +2526,16 @@ describe("conversation order", () => {
     const t = setup();
     await t.record(threadLane("t-slow"), [post("t-slow", "slow-1")]);
     await t.record(threadLane("t-fast"), [post("t-fast", "fast-1")]);
-    const slow = gate();
+    const slow = deferred();
     t.sendToThread.mockImplementation(async (request) => {
-      if (request.body === "slow-1") await slow.opened;
+      if (request.body === "slow-1") await slow.promise;
       return { handle: `handle-${request.body}` };
     });
 
     const sending = t.delivery.send([threadLane("t-slow"), threadLane("t-fast")]);
     // The fast conversation is out before the slow one answers.
     await vi.waitFor(() => expect(statuses(t)).toEqual(["in-flight", "sent"]));
-    slow.open();
+    slow.resolve();
     await sending;
 
     expect(statuses(t)).toEqual(["sent", "sent"]);
@@ -2431,9 +2544,9 @@ describe("conversation order", () => {
   it("keeps one conversation in order while its first send is running", async () => {
     const t = setup();
     await t.record(threadLane("t-a"), [post("t-a", "a-1"), post("t-a", "a-2")]);
-    const first = gate();
+    const first = deferred();
     t.sendToThread.mockImplementationOnce(async () => {
-      await first.opened;
+      await first.promise;
       return { handle: "h-1" };
     });
 
@@ -2444,7 +2557,7 @@ describe("conversation order", () => {
     await t.delivery.send([threadLane("t-a")]);
     expect(t.sendToThread).toHaveBeenCalledOnce();
 
-    first.open();
+    first.resolve();
     await sending;
     expect(bodies(t)).toEqual(["a-1", "a-2"]);
     expect(statuses(t)).toEqual(["sent", "sent"]);
