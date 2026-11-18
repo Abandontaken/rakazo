@@ -4,6 +4,7 @@ import type {
   CacheCapabilities as ConnectionCacheCapabilities,
   ConnectionCatalogItem,
   HistoryToolStep,
+  LifecycleEmailKind,
   ModelApiProtocol,
   PurchaseCardField,
   SandboxKind,
@@ -800,13 +801,18 @@ export interface ModelCallObserver {
     provider: string;
     modelId: string;
     inputTokensEstimate: number;
-    maxOutputTokens: number;
+    /** Null when the protocol cannot enforce an output bound. */
+    maxOutputTokens: number | null;
     /** Conservative dollar bound from the resolved model pricing; absent means unknown. */
     maxCostUsd?: number;
     /** Explicit adapter-known write bucket required by this request, not a billing prediction. */
     cacheWriteRetention?: "1h";
   }): string | Promise<string>;
-  afterCall(reservationId: string, usage: AgentUsage | null): void | Promise<void>;
+  afterCall(
+    reservationId: string,
+    /** Null proves the call did not start; uncertain dispatched usage needs an explicit receipt. */
+    usage: AgentUsage | null,
+  ): void | AgentUsage | Promise<void> | Promise<AgentUsage | undefined>;
   onRequestId?(reservationId: string, providerRequestId: string): void | Promise<void>;
 }
 
@@ -888,7 +894,20 @@ export interface VoiceInfo {
   description?: string;
 }
 
+/** Provider evidence only; no transcript, audio or credentials. */
+export interface VoiceUsage {
+  model: string;
+  unit: "characters" | "seconds" | "tokens";
+  units: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  inputAudioTokens?: number;
+  inputTextTokens?: number;
+}
+
 export interface SpeechClip {
+  providerRequestId?: string;
+  usage?: VoiceUsage;
   bytes: Uint8Array;
   mimeType: "audio/mpeg" | "audio/wav" | "audio/ogg";
   /** The voice actually used, when the provider substituted one for the requested voice. */
@@ -923,6 +942,7 @@ export interface VoiceSynthesizeRequest {
 }
 
 export interface VoiceTranscribeRequest {
+  model?: string;
   audio: Uint8Array;
   mimeType: string;
   apiKey: string;
@@ -1029,9 +1049,23 @@ export interface BackgroundJobPayloads {
   "media.poll": { jobId: string };
   /** Read an Expo push receipt; the token is identified by its digest, never stored. */
   "push.receipt": { userId: string; ticketId: string; tokenDigest: string };
+  /**
+   * One lifecycle mail to an organization's owner, re-checked when it fires. The API writes the
+   * message when it schedules: only it holds the templates and the key that signs the
+   * unsubscribe link. The address is read when the mail is sent.
+   */
+  "email.lifecycle": {
+    kind: LifecycleEmailKind;
+    organizationId: string;
+    userId: string;
+    message: Pick<TransactionalEmail, "subject" | "text" | "html" | "headers">;
+  };
 }
 
-/** What held a secret-store reference before it was replaced or dropped. */
+/**
+ * What held a secret-store reference before it was replaced or dropped. `store_write` is an entry
+ * written before any record held it, which every record that can hold a reference may claim.
+ */
 export type SecretCleanupKind =
   | "secret_row"
   | "secret_tables"
@@ -1040,7 +1074,8 @@ export type SecretCleanupKind =
   | "purchase_request"
   | "purchase_card"
   | "purchase_token"
-  | "payment_wallet";
+  | "payment_wallet"
+  | "store_write";
 
 export type BackgroundJobName = keyof BackgroundJobPayloads;
 
@@ -1098,6 +1133,11 @@ export type SecretContext = string | { recordId: string; signal?: AbortSignal };
 export interface SecretPutOptions {
   recordId?: string;
   ephemeral?: boolean;
+  /**
+   * A store that keeps entries remotely calls this with the new entry before writing it, and does
+   * not write when it rejects, so a backup can name the entry before it exists.
+   */
+  beforeWrite?: (entry: { recordId: string; ref: string }) => Promise<void>;
 }
 export type SecretChangeListener = (ref: string) => void;
 
@@ -1632,10 +1672,11 @@ export interface AutoReviewRequest {
    */
   newSite?: boolean;
   /**
-   * A save to the bot's memory after the run took in outside content. The bot reads saved memory
-   * as trusted context in every later run, so the saved text is judged as a standing instruction.
+   * A save to the bot's memory or skills after the run took in outside content. The bot reads
+   * both as trusted context in every later run, so the saved text is judged as a standing
+   * instruction.
    */
-  memoryWrite?: boolean;
+  savedContextWrite?: boolean;
 }
 
 export interface AutoReviewResult {
@@ -1648,9 +1689,9 @@ export interface AutoReviewResult {
 export type BillingSubscriptionStatus =
   | "trialing"
   | "active"
-  | "past_due"
   | "incomplete"
   /** No access; the subscription resumes from the billing portal, so a new checkout would double-bill. */
+  | "past_due"
   | "unpaid"
   | "paused"
   | "canceled";
@@ -1716,6 +1757,8 @@ export interface BillingSubscriptionSnapshot {
   currentPeriodEndsAt: Date | null;
   cancelAtPeriodEnd: boolean;
   endedAt: Date | null;
+  /** When the latest invoice was settled, if it billed anything: a trial's free invoice is no payment. */
+  paidAt?: Date;
   /** The flat own-key plan, which grants access without credits. */
   byokPlan?: boolean;
   /** What the own-key plan bills each period, which stays at the price it was bought at. */
