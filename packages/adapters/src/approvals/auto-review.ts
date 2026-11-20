@@ -50,7 +50,6 @@ export type AutoReviewProviderKind = "llm" | "jev" | "scripted";
 export const JEV_AUTO_REVIEW_PROVIDER = "jev";
 export const SCRIPTED_AUTO_REVIEW_PROVIDER = "scripted";
 export const DEFAULT_JEV_MODEL = "jev-latest";
-export const DEFAULT_AUTO_REVIEW_MIN_CONFIDENCE = 0.5;
 
 export function autoReviewTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.RAKAZO_AUTO_REVIEW_TIMEOUT_MS?.trim();
@@ -66,11 +65,12 @@ export function typesafeApiKey(env: NodeJS.ProcessEnv = process.env): string | u
   return value || undefined;
 }
 
-export function autoReviewMinConfidence(env: NodeJS.ProcessEnv = process.env): number {
+/** The operator's confidence floor for every decision model; unset, each model's calibration decides. */
+export function autoReviewMinConfidence(env: NodeJS.ProcessEnv = process.env): number | undefined {
   const raw = env.RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE?.trim();
-  if (!raw) return DEFAULT_AUTO_REVIEW_MIN_CONFIDENCE;
+  if (!raw) return undefined;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0 || value > 1) return DEFAULT_AUTO_REVIEW_MIN_CONFIDENCE;
+  if (!Number.isFinite(value) || value < 0 || value > 1) return undefined;
   return value;
 }
 
@@ -131,6 +131,43 @@ export function resolveAutoReviewChecker(
   const deployment = resolveDeploymentModel(env);
   if (!deployment.model) return null;
   return { provider: deployment.provider, model: deployment.model };
+}
+
+/**
+ * The deployment's operator-funded reviewer, when hosted credits include one. It is what a
+ * member who chose no approval model runs, and needs no connection or credits of theirs.
+ */
+export function includedReviewChecker(
+  creditsEnabled: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): AutoReviewChecker | null {
+  if (!creditsEnabled) return null;
+  const checker = resolveAutoReviewChecker(env, true);
+  if (
+    !checker ||
+    !decisionModel(checker.provider, checker.model) ||
+    !isAutoReviewCheckerConfigured({ env, checker })
+  )
+    return null;
+  return { ...checker, included: true };
+}
+
+/**
+ * Whether the deployment pays for its default reviewer, as runs fund it for a member who chose
+ * no approval model: with hosted credits on, a configured decision model or verifier.
+ */
+export function deploymentPaysForReview(
+  checker: AutoReviewChecker,
+  creditsEnabled: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    creditsEnabled &&
+    (Boolean(decisionModel(checker.provider, checker.model)) ||
+      checker.provider === JEV_AUTO_REVIEW_PROVIDER ||
+      checker.provider === SCRIPTED_AUTO_REVIEW_PROVIDER) &&
+    isAutoReviewCheckerConfigured({ env, checker })
+  );
 }
 
 /**
@@ -329,6 +366,7 @@ export async function runAutoReviewJudge(
             gatewayId: input.gatewayId,
             projectId: input.projectId,
             region: input.region,
+            zeroDataRetention: input.zeroDataRetention,
             baseUrl: input.baseUrl,
             headers: input.headers,
             allowPrivateEndpoint: input.allowPrivateEndpoint,
@@ -417,6 +455,7 @@ export type LlmAutoReviewOptions = {
   gatewayId?: string;
   projectId?: string;
   region?: string;
+  zeroDataRetention?: boolean;
   baseUrl?: string;
   headers?: Record<string, string>;
   allowPrivateEndpoint?: boolean;
