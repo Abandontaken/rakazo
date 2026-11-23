@@ -43,7 +43,7 @@ import {
 } from "../evals/report.js";
 import { ROUTINE_MODE_SUITE } from "../evals/routine-mode.js";
 import type { CasePlan } from "../evals/run-store.js";
-import { judgeIdentity, RunStore } from "../evals/run-store.js";
+import { RunStore } from "../evals/run-store.js";
 import {
   APPS_EVAL_CASES,
   APPS_FIXTURE_VERSION,
@@ -130,7 +130,7 @@ async function main() {
       "base-url": { type: "string" },
       "context-window": { type: "string" },
       "max-output-tokens": { type: "string" },
-      trials: { type: "string", default: "3" },
+      trials: { type: "string", default: "1" },
       case: { type: "string", multiple: true },
       "cases-file": { type: "string" },
       "timeout-ms": { type: "string", default: "180000" },
@@ -776,7 +776,7 @@ async function main() {
                   trials: controls.trials,
                   strategy: planned.strategy!,
                   fingerprint,
-                  judge: judgeIdentity(report.judge),
+                  judge: report.judge,
                 })
               : { kind: "run" };
           plans.set(key, plan);
